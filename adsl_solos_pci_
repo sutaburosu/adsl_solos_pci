@@ -1,0 +1,699 @@
+#!/bin/sh
+# -*- sh -*-
+
+: <<=cut
+
+=head1 NAME
+
+adsl_solos_pci_ - Graphs telemetry from the Solos ADSL2+ PCI card.
+
+=head1 APPLICABLE SYSTEMS
+
+Any machine containing a Traverse Solos multi-port ADSL2+ PCI card,
+running Linux >=2.6.23 and Bash >=3.2.  Tested in Munin 1.4 and 2.0.
+
+=head1 CONFIGURATION
+
+When used with 'munin-node-configure --suggest --shell' a list of ADSL ports
+in 'Showtime' state will be suggested.
+
+In a machine with more than one active port a multigraph configuration will 
+additionally be suggested (indicated by a port range in the filename, ie 0-3).
+
+=head1 CUSTOMISATION
+
+You may customise various aspects of the plugin by adding some or all of these
+directives to ${MUNIN_CONFDIR}/plugin-conf.d/munin-node:
+
+  [adsl_*]
+      # The default category is 'network', but I prefer 'adsl'
+      env.category adsl
+      
+      # The default port names are 'solos-pci0', etc
+      env.portname  Friendly name for port
+
+      # You may change the appearance of the graphs like this:
+      env.width     400
+      env.height    175
+      env.thickness 1
+
+      # Most folks aren't interested in things like attenuation until they
+      # have a problem and are seeking information.  These settings allow you
+      # to disable showing graphs,  but continue to capture their data.
+      env.showrates no
+      env.showquality no
+      env.showthroughput no
+
+  # These ports are associated with ppp1 rather than the default ppp0:
+  [adsl_rates_solos_pci_1-3]
+      env.pppdevice 1
+      env.portname  Friendly name for this group of ports
+      env.name      Friendly name for multigraph overviews
+  [adsl_quality_solos_pci_1-3]
+      # The ports in this group are associated with ppp1 (default ppp0):
+      env.pppdevice 1
+      env.portname  Friendly name for this group of ports
+      env.name      Friendly name for multigraph overviews
+  [adsl_throughput_solos_pci_1-3]
+      # The ports in this group are associated with ppp1 (default ppp0):
+      env.pppdevice 1
+      env.portname  Friendly name for this group of ports
+      env.name      Friendly name for multigraph overviews
+
+Remember to restart the munin-node service after modifying the configuration
+files.
+
+=head1 KNOWN ISSUES
+
+I still haven't got a multilink PPP setup, so the multigraph support is far from complete.
+
+Unfortunately,  the counters provided by the driver for the Reed-Solomon error
+correction are only 16-bits wide.  If, over Munin's five-minute sample period,
+a single port accrues more than approximately 200 errors per second the
+counters will wrap more frequently than we read them;  this will cause
+misleadingly optimistic graphs.
+
+Currently the driver returns 'ERROR' when retrieving TotalRxBlocks and
+TotalTxBlocks.  As ATM frames are all exactly 63 bytes these values would
+indicate the exact throughput,  yielding a much more accurate depiction than
+the PPP octet counters currently used.
+
+=head1 BUGS
+
+I'd love to hear from you regarding any problems,  suggestions or patches
+at the email address in the AUTHOR section.
+
+Please include the output of:
+
+  ADSLDEBUG=1 munin-run adsl_solos_pci_0
+
+This has only been tested on PPPoA AAL5 circuits.  If you are running
+some other configuration (or newer firmware) please also email the
+diagnostics output.  Of particular interest would be a configuration where 
+TotalRxBlocks and TotalTxBlocks return useful information,  or PPPoE.
+
+=head1 VERSION
+
+  adsl_solos_pci_ v0.07
+  2010-10-15
+
+=head1 AUTHOR
+
+(C) 2010 Steve Dommett <steve@st4vs.net>
+
+=head1 LICENSE
+
+AGPLv3
+
+=head1 MAGIC MARKERS
+
+  #%# family=auto
+  #%# capabilities=autoconf suggest
+
+=cut
+
+
+
+###################
+# Based on Munin's plugin.sh but using only Bash builtins
+clean_fieldname_nofork () {
+    # Clean up field name so it complies with munin requirements.
+    # Even though most versions of munin sanitises field names
+    # this at least avoids getting .s in field names which will
+    # very much still break munin.
+    #
+    # usage: name="$(clean_fieldname "$item")"
+    #
+    
+    local tmp="${@/[^A-Za-z_]/_}"
+    echo "${tmp//[^A-Za-z0-9_]/_}"
+}
+
+
+
+###################
+# Auto-configure Munin if the Solos kernel driver is loaded and functional
+# on port 0  (should be guaranteed to be available if a card is installed)
+do_autoconf () {
+    if [[ -r "${solospath/!/0}" ]]; then
+        echo 'yes'
+        exit 0
+    else
+        echo "no (${solospath/!/0} not found)"
+        exit 251
+    fi
+    exit 0
+}
+
+
+
+###################
+# Suggest active interfaces to Munin, limiting to ports in Showtime only
+do_suggest () {
+    # Enumerate installed ports
+    for i in ${solosprefix}*; do
+        # Extract the digit(s) signifying the port number
+        port="${i/#${solosprefix}/}"
+        # Test for Showtime (Handshake is seen even with nothing plugged in)
+        if [[ -r "${solospath/!/$port}/State" ]]; then
+            < "${solospath/!/$port}/State" read -r
+            if [[ "$REPLY"  == 'Showtime' ]]; then
+                ports="${ports} ${port}"
+                active=$[active + 1]
+                high=${port}
+                low=${low:-$port}
+            fi
+        fi
+    done
+    # If there's more than one active port, suggest a multigraph config
+    if [[ ${active} -gt 1 ]]; then
+        echo "${low}-${high}"
+    else
+        for i in ${ports}; do
+            echo $i
+        done
+    fi
+    exit 0
+}
+
+
+
+###################
+# Line rates
+do_multigraph_config_rates () {
+    echo "graph_title ADSL2+ IP data and line synch rates (${name})"
+    echo "graph_category ${category}"
+    echo "graph_args --base 1000 --units=si " # --lower-limit 0"
+    echo "graph_vlabel Bit rate (bits/s)"
+    echo "graph ${showrates:-yes}"
+    echo "graph_height ${height:-175}"
+    echo "graph_width ${width:-400}"
+    echo -n "graph_info This graph shows synch rates for "
+    echo "Conexant Solos D ADSL2+ ${portname} (bits/s)"
+    
+    echo "graph_order rx_bytes=adsl_solos_pci_0.rx_bytes"
+    echo "rx_bytes.label Downstream IP bits/\${graph_period}"
+    echo "rx_bytes.type DERIVE"
+    echo "rx_bytes.info Downstream IP bits/\${graph_period}"
+    echo "rx_bytes.cdef rx_bytes,8,*"
+    echo "rx_bytes.draw LINE${thickness:-1}"
+
+    echo "tx_bytes.label Upstream IP bits/\${graph_period}"
+    echo "tx_bytes.type DERIVE"
+    echo "tx_bytes.info Upstream IP bits/\${graph_period}"
+    echo "tx_bytes.cdef tx_bytes,8,*"
+    echo "tx_bytes.draw LINE${thickness:-1}"
+
+    echo "RxBitRate.label Downstream synch (bits/s)"
+    echo "RxBitRate.type GAUGE"
+    echo "RxBitRate.info Downstream synch rate (bits/s)"
+    echo "RxBitRate.draw LINE${thickness:-1}"
+    
+    echo "RxATTNDR.label Attainable net downstream (bits/s)"
+    echo "RxATTNDR.type GAUGE"
+    echo "RxATTNDR.info Downstream attainable net data rate (bits/s)"
+    echo "RxATTNDR.draw LINE${thickness:-1}"
+    
+    echo "TxBitRate.label Upstream synch (bits/s)"
+    echo "TxBitRate.type GAUGE"
+    echo "TxBitRate.info Upstream synch rate (bits/s)"
+    echo "TxBitRate.draw LINE${thickness:-1}"
+    
+    echo "TxATTNDR.label Attainable net upstream (bits/s)"
+    echo "TxATTNDR.type GAUGE"
+    echo "TxATTNDR.info Upstream attainable net data rate (bits/s)"
+    echo "TxATTNDR.draw LINE${thickness:-1}"
+
+}
+do_config_rates () {
+    echo "graph_title ADSL2+ IP data and line synch rates (${portname})"
+    echo "graph_category ${category}"
+    echo "graph_args --base 1000 --units=si " # --lower-limit 0"
+    echo "graph_vlabel Bit rate (bits/s)"
+    echo "graph ${showrates:-yes}"
+    echo "graph_height ${height:-175}"
+    echo "graph_width ${width:-400}"
+    echo -n "graph_info This graph shows synch rates for "
+    echo "Conexant Solos D ADSL2+ ${portname} (bits/s)"
+
+    echo "rx_bytes.label Downstream IP bits/\${graph_period}"
+    echo "rx_bytes.type DERIVE"
+    echo "rx_bytes.info Downstream IP bits/\${graph_period}"
+    echo "rx_bytes.cdef rx_bytes,8,*"
+    echo "rx_bytes.draw LINE${thickness:-1}"
+
+    echo "tx_bytes.label Upstream IP bits/\${graph_period}"
+    echo "tx_bytes.type DERIVE"
+    echo "tx_bytes.info Upstream IP bits/\${graph_period}"
+    echo "tx_bytes.cdef tx_bytes,8,*"
+    echo "tx_bytes.draw LINE${thickness:-1}"
+
+    echo "RxBitRate.label Downstream synch (bits/s)"
+    echo "RxBitRate.type GAUGE"
+    echo "RxBitRate.info Downstream synch rate (bits/s)"
+    echo "RxBitRate.draw LINE${thickness:-1}"
+    
+    echo "RxATTNDR.label Attainable net downstream (bits/s)"
+    echo "RxATTNDR.type GAUGE"
+    echo "RxATTNDR.info Downstream attainable net data rate (bits/s)"
+    echo "RxATTNDR.draw LINE${thickness:-1}"
+    
+    echo "TxBitRate.label Upstream synch (bits/s)"
+    echo "TxBitRate.type GAUGE"
+    echo "TxBitRate.info Upstream synch rate (bits/s)"
+    echo "TxBitRate.draw LINE${thickness:-1}"
+    
+    echo "TxATTNDR.label Attainable net upstream (bits/s)"
+    echo "TxATTNDR.type GAUGE"
+    echo "TxATTNDR.info Upstream attainable net data rate (bits/s)"
+    echo "TxATTNDR.draw LINE${thickness:-1}"
+}
+do_values_rates () {
+    # rx_bytes (922476923)
+    fields="rx_bytes tx_bytes"
+    for field in $fields; do
+        < "${ppppath/!/$port}/${field}" read -r
+        echo "${field}.value ${REPLY:-U}"
+    done
+
+    #RxATTNDR    (7948000)  ()
+    fields="RxBitRate RxATTNDR TxBitRate TxATTNDR"
+    for field in $fields; do
+        < "${solospath/!/$port}/${field}" read -r
+        if [[ "$REPLY" == '0' ]]; then
+            REPLY='U'
+        fi
+        echo "${field}.value ${REPLY:-U}"
+    done
+}
+
+
+###################
+# Line quality
+do_config_quality () {
+    echo "graph_title ADSL2+ Line Quality (${portname})"
+    echo "graph_category ${category}"
+    echo "graph_args --base 1000 --units=si" # --lower-limit 0"
+    echo "graph_period minute"
+    echo "graph ${showquality:-yes}"
+    echo "graph_height ${height:-175}"
+    echo "graph_width ${width:-400}"
+    echo "graph_vlabel SNR margin / attenuation / power (dB)"
+    echo -n "graph_info This graph shows attenuation, signal-to-noise margin "
+    echo "and transmit power for ${portname} (dB)"
+    
+    echo "RemoteSNRMargin.label Remote SNR margin (dB)"
+    echo "RemoteSNRMargin.type GAUGE"
+    echo "RemoteSNRMargin.info Remote signal-to-noise margin (dB)"
+    echo "RemoteSNRMargin.draw LINE${thickness:-1}"
+
+    echo "LocalSNRMargin.label Local SNR margin (dB)"
+    echo "LocalSNRMargin.type GAUGE"
+    echo "LocalSNRMargin.info Local signal-to-noise margin (dB)"
+    echo "LocalSNRMargin.draw LINE${thickness:-1}"
+
+    echo "RemoteLineAttn.label Remote attenuation (dB)"
+    echo "RemoteLineAttn.type GAUGE"
+    echo "RemoteLineAttn.info Remote attenuation (dB)"
+    echo "RemoteLineAttn.draw LINE${thickness:-1}"
+
+    echo "LocalLineAttn.label Local attenuation (dB)"
+    echo "LocalLineAttn.type GAUGE"
+    echo "LocalLineAttn.info Local attenuation (dB)"
+    echo "LocalLineAttn.draw LINE${thickness:-1}"
+
+    echo "RemoteTxPower.label Remote TX power (dB)"
+    echo "RemoteTxPower.type GAUGE"
+    echo "RemoteTxPower.info Remote transmit power (dB)"
+    echo "RemoteTxPower.draw LINE${thickness:-1}"
+
+    echo "LocalTxPower.label Local TX power (dB)"
+    echo "LocalTxPower.type GAUGE"
+    echo "LocalTxPower.info Local transmit power (dB)"
+    echo "LocalTxPower.draw LINE${thickness:-1}"
+
+    # This seems to give identical results to LocalLineAttn
+    #echo "RawAttn.label Raw attenuation (dB)"
+    #echo "RawAttn.type GAUGE"
+    #echo "RawAttn.info Raw attenuation (dB)"
+    #echo "RawAttn.draw LINE${thickness:-1}"
+}
+do_values_quality () {
+    #RemoteSNRMargin (11 dB ) ()
+    fields="RemoteSNRMargin LocalSNRMargin RemoteLineAttn LocalLineAttn\
+     RemoteTxPower LocalTxPower" #RawAttn"
+    for field in $fields; do
+        < "${solospath/!/$port}/${field}" read -r
+        #if [[ ${REPLY} =~ \s*([-0-9.]+)(\s*dB\s*)? ]]
+        if [[ ${REPLY} =~ \s*(([-0-9]+)(.[0-9])?)([0-9]+)?(\s*dB\s*)? ]]
+        then
+            echo "${field}.value ${BASH_REMATCH[1]}"
+        else
+            echo "${field}.value U"
+        fi
+    done
+}
+
+
+
+###################
+# Frame errors
+do_config_throughput () {
+    echo "graph_title ADSL2+ Throughput & Errors/\${graph_period} (${portname})"
+    echo "graph_category ${category}"
+    echo "graph_args --base 1000 --units=si" # --lower-limit 0"
+    echo "graph_period second"
+    echo "graph ${showerrors:-yes}"
+    echo "graph_height ${height:-175}"
+    echo "graph_width ${width:-400}"
+    echo "graph_vlabel Frames & (Un)Corrected errors/\${graph_period}"
+    echo -n "graph_info This graph shows frames throughput and (un)corrected"
+    echo "errors/\${graph_period} for ${portname}"
+
+    echo "RSCorrectedErrorsDn.label Downstream RS corrections/\${graph_period}"
+    echo "RSCorrectedErrorsDn.type DERIVE"
+    echo "RSCorrectedErrorsDn.min 0"
+    echo "RSCorrectedErrorsDn.max 65535"
+    echo "RSCorrectedErrorsDn.draw LINE${thickness:-1}"
+    echo -n "RSCorrectedErrorsDn.info Downstream Reed-Solomon corrections/"
+    echo "\${graph_period}"
+
+    echo "RSUnCorrectedErrorsDn.label Downstream RS failures/\${graph_period}"
+    echo "RSUnCorrectedErrorsDn.type DERIVE"
+    echo "RSUnCorrectedErrorsDn.min 0"
+    echo "RSUnCorrectedErrorsDn.max 65535"
+    echo "RSUnCorrectedErrorsDn.draw LINE${thickness:-1}"
+    echo -n "RSUnCorrectedErrorsDn.info Downstream Reed-Solomon failures/"
+    echo "\${graph_period}"
+    
+    echo "RSCorrectedErrorsUp.label Upstream RS corrections/\${graph_period}"
+    echo "RSCorrectedErrorsUp.type DERIVE"
+    echo "RSCorrectedErrorsUp.min 0"
+    echo "RSCorrectedErrorsUp.max 65535"
+    echo "RSCorrectedErrorsUp.draw LINE${thickness:-1}"
+    echo -n "RSCorrectedErrorsUp.info Upstream Reed-Solomon corrections/"
+    echo "\${graph_period}"
+    
+    echo "RSUnCorrectedErrorsUp.label Upstream RS failures/\${graph_period}"
+    echo "RSUnCorrectedErrorsUp.type DERIVE"
+    echo "RSUnCorrectedErrorsUp.min 0"
+    echo "RSUnCorrectedErrorsUp.max 65535"
+    echo "RSUnCorrectedErrorsUp.draw LINE${thickness:-1}"
+    echo -n "RSUnCorrectedErrorsUp.info Upstream Reed-Solomon failures/"
+    echo "\${graph_period}"
+
+    echo "rx_packets.label Downstream IP packets/\${graph_period}"
+    echo "rx_packets.type DERIVE"
+    echo "rx_packets.min 0"
+    echo "rx_packets.max 4000"
+    echo "rx_packets.info Downstream IP packets/\${graph_period}"
+    echo "rx_packets.draw LINE${thickness:-1}"
+
+    echo "tx_packets.label Upstream IP packets/\${graph_period}"
+    echo "tx_packets.type DERIVE"
+    echo "tx_packets.min 0"
+    echo "tx_packets.max 4000"
+    echo "tx_packets.info Upstream IP packets/\${graph_period}"
+    echo "tx_packets.draw LINE${thickness:-1}"
+
+    echo "rx_pdus.label Downstream AAL5 PDUs/\${graph_period}"
+    echo "rx_pdus.type DERIVE"
+    echo "rx_pdus.min 0"
+    echo "rx_pdus.max 4000"
+    echo "rx_pdus.info Downstream AAL5 PDUs/\${graph_period}"
+    echo "rx_pdus.draw LINE${thickness:-1}"
+
+    echo "tx_pdus.label Upstream AAL5 PDUs/\${graph_period}"
+    echo "tx_pdus.type DERIVE"
+    echo "tx_pdus.min 0"
+    echo "tx_pdus.max 4000"
+    echo "tx_pdus.info Upstream AAL5 PDUs/\${graph_period}"
+    echo "tx_pdus.draw LINE${thickness:-1}"
+
+    echo "rxerr_pdus.label Downstream AAL5 errors/\${graph_period}"
+    echo "rxerr_pdus.type COUNTER"
+    echo "rxerr_pdus.info Downstream AAL5 errors/\${graph_period}"
+    echo "rxerr_pdus.draw LINE${thickness:-1}"
+
+    echo "txerr_pdus.label Upstream AAL5 errors/\${graph_period}"
+    echo "txerr_pdus.type COUNTER"
+    echo "txerr_pdus.info Upstream AAL5 errors/\${graph_period}"
+    echo "txerr_pdus.draw LINE${thickness:-1}"
+
+    echo "drop_pdus.label Dropped AAL5 PDUs/\${graph_period}"
+    echo "drop_pdus.type COUNTER"
+    echo "drop_pdus.info Dropped AAL5 PDUs/\${graph_period}"
+    echo "drop_pdus.draw LINE${thickness:-1}"
+}
+# These are 16-bit counters.  If your line is noisy (ie more than approximately
+# 200 errors/second) then the counters will wrap more frequently than we read.
+#RSCorrectedErrorsDn    (36407) (0)
+do_values_throughput () {
+    fields="RSCorrectedErrorsDn RSUnCorrectedErrorsDn\
+     RSCorrectedErrorsUp RSUnCorrectedErrorsUp"
+    for field in $fields; do
+        < "${solospath/!/$port}/${field}" read -r
+        echo "${field}.value ${REPLY:-U}"
+    done
+
+    # rx_bytes (922476923)
+    fields="rx_packets tx_packets"
+    for field in $fields; do
+        < "${ppppath/!/$port}/${field}" read -r
+        echo "${field}.value ${REPLY:-U}"
+    done
+
+    #Itf Type    ESI/"MAC"addr AAL(TX,err,RX,err,drop) ...               [refcnt]
+    #  0 solos-pci000000000000  0 ( 0 0 0 0 0 )  5 ( 6328190 0 8120206 0 0 ) [2]
+    #  1 solos-pci000000000000  0 ( 0 0 0 0 0 )  5 ( 0 0 0 0 0 )     [1]
+    exec 3< "${atmpath}"
+    tmp=${port}
+    while [[ tmp -ge 0 ]]; do
+        read -ru3
+        tmp=$[--tmp]
+    done
+    read -u3 itf type mac aal0open aal0tx aal0txerr aal0rx aal0rxerr\
+        aal0drop aal0close aal5 aal5open aal5tx aal5txerr aal5rx aal5rxerr\
+        aal5drop aal5close refcnt superfluous
+    exec 3<&-
+    echo "rx_pdus.value ${aal5rx:-U}"
+    echo "tx_pdus.value ${aal5tx:-U}"
+    echo "rxerr_pdus.value ${aal5rxerr:-U}"
+    echo "txerr_pdus.value ${aal5txerr:-U}"
+    echo "drop_pdus.value ${aal5drop:-U}"
+
+    # Send / rcv buffer capacity/usage
+    #cat /proc/net/atm/vc 
+    #Address Itf VPI VCI   Fam Flags Reply Send buffer     Recv buffer      [refcnt]
+    #ecfea400   0   0    38 PVC 0043      0       0/ 112640       0/ 112640 [2]
+
+}
+
+
+
+###################
+# Emit the graph configuration
+do_config () {
+    if [[ -n "$multigraph" ]]; then
+        echo "multigraph solos.$type"
+        do_multigraph_config_$type
+    fi
+    port="$lowport"
+    while [[ $port -le $highport ]]; do
+        if [[ -n "$multigraph" ]]; then
+            echo "multigraph solos.${type}_${port}"
+        fi      
+        do_config_$type
+        port=$[port + 1]
+    done
+}
+
+
+
+###################
+# Emit the current readings
+do_values () {
+    if [[ -n "$multigraph" ]]; then
+        echo "multigraph solos.$type"
+        do_multigraph_values_$type
+    fi
+    port="$lowport"
+    while [[ $port -le $highport ]]; do
+        if [[ -n "$multigraph" ]]; then
+            echo "multigraph solos.${type}_${port}"
+        fi      
+        do_values_$type
+        port=$[port + 1]
+    done
+}
+
+
+
+###################
+# Show all the raw data from the card
+do_rawdump () {
+    echo ""
+    for i in ${solospath/!/$port}/*; do
+        echo -n "${i##*/} "
+        for j in ${solospath/!/*}/${i##*/}; do
+            < "$j" read -r; echo -en "\t($REPLY)"
+        done
+        echo ""
+    done
+    exec 
+}
+
+
+###################
+# Emit the diagnostics
+do_diagnose () {
+    echo "Diagnostics to help with debugging and supporting changes due to"
+    echo "newer Solos drivers or other unforeseen circumstances."
+    echo ""
+    echo "name $0"
+    echo "type $type"
+    echo "port $port"
+    if [[ -n "$multigraph" ]]; then
+        echo "multigraph $multigraph"
+    else
+        echo "no multigraph"
+    fi
+    
+    echo "--------rates---------------"
+    do_values_rates
+    echo "--------quality-------------"
+    do_values_quality
+    echo "--------errors--------------"
+    do_values_throughput
+    echo "--------env-----------------"
+    set
+    echo "--------rawdump-------------"
+    do_rawdump
+    echo "----------------------------"
+    echo "Please email this to <steve@st4vs.net> for assistance."
+    exit 0
+}
+
+
+
+###################
+#Main entry point
+
+# Test for Bash >=3.2
+if [[ -z "${BASH_VERSINFO}" || \
+    "${BASH_VERSINFO[0]}${BASH_VERSINFO[1]}" -lt 32 ]]
+then
+    echo "Bash version 3.2 or later is required."
+    exit 255
+fi
+
+# Ascertain which type of graph to make,  or bail out if our name is wrong
+if [[ ${0##*/} =~ \
+    ^adsl(_(rates|quality|throughput))?_solos_pci_([0-9]+)?((-)([0-9]+))?(_([A-Za-z]+))? ]]
+    # yes, that also allows a non-standard suffix, used during testing
+then
+    type="${BASH_REMATCH[2]}"
+    port="${BASH_REMATCH[3]}"
+    multigraph="${BASH_REMATCH[5]}"
+    lowport="${BASH_REMATCH[3]}"
+    highport="${BASH_REMATCH[6]}"
+    suffix="${BASH_REMATCH[8]}"
+else
+    echo "Solos plugin in ${MUNIN_CONFDIR}/plugins/ must be named one of:"
+    echo "    adsl_rates_solos_pci_X"
+    echo "    adsl_quality_solos_pci_X"
+    echo "    adsl_throughput_solos_pci_X"
+    echo ""
+    echo "Where X is one of:"
+    echo "    0 1 2 3 4 5 etc : specifies a single ADSL port to monitor"
+    echo "    0-1 2-3 0-3 etc : multigraph the first 2, second 2 or all 4 ports"
+    echo ""
+    echo "Currently this plugin is named: ${0##*/}"
+    exit 254
+fi
+
+
+
+if [[ -n "$multigraph" ]]; then
+    # Source the Munin helper functions
+    . ${MUNIN_LIBDIR}/plugins/plugin.sh || exit 253
+    is_multigraph "$@"
+    : ${portname:=solos-pci${lowport}-${highport}}
+    multigraph="multigraph_"
+else
+    lowport="$port"
+    highport="$port"
+    multigraph=""
+fi
+
+
+# Munin expects us to return values when no mode is specified
+mode="${1:-values}"
+
+
+###################
+# Set default values for anything not specified in munin-node.conf
+: ${category:=network}
+: ${pppdevice:=0}
+: ${portname:=solos-pci${port}}
+
+# The Solos driver exports information via sysfs with names starting:
+if [[ -e /sys/devices/virtual/atm ]]; then
+: ${solosprefix:=/sys/devices/virtual/atm/solos-pci}
+else
+: ${solosprefix:=/sys/class/atm/solos-pci}
+fi
+# and inside each of those,  there's an interesting sub-folder
+: ${solospath:=${solosprefix}!/parameters}
+
+# PPP instrumentation is available with names starting:
+: ${pppprefix:=/sys/devices/virtual/net/ppp}
+# again with an interesting sub-folder:
+: ${ppppath:=${pppprefix}!/statistics}
+
+# And there's a little more information on ATM circuits in this file:
+: ${atmpath:=/proc/net/atm/devices}
+
+if [[ -n "$ADSLDEBUG" ]]; then
+    ADSLDEBUG='diagnose'
+fi
+
+do_${ADSLDEBUG:-$mode} 2>/dev/null || {
+      echo "This plugin doesn't support mode ${type} ${mode}" >&2
+      exit 252
+}
+
+exit 0;
+
+
+
+
+
+###################
+# Other possibly interesting Solos fields
+#APIVersion		(GS_API_652)
+#DriverVersion		(1.75)
+#Version         	(1.07)
+#FirmwareVersion	(E.25.41.64.TCA )
+#SupportedAnnexes	(BisA/BisM/AnnexA/T1413A)
+
+#TotalRxBlocks		(ERROR)	(ERROR)
+#TotalTxBlocks		(ERROR)	(ERROR)
+#TotalStart		(ERROR)	(ERROR)
+#ShowtimeStart		(99510)	(0)
+#Watchdog		(0x00000053)	(0x00000000)
+#OperationProgress	(0x000000ad)	(0x00000018)
+#OperationalMode	(G.Dmt)	(Inactive)
+
+#SRACnt			(0)	()	(Seamless rate adaptation)
+#SRACntUp		(0)	()
+#LineUpCount		(2)	(0)
+#LocalEndLOS		(0)	(0)
+#RemoteLOS		(2)	(0)
+#LocalSEF		(0)	(0)	(Severely errored frames)
+#RemoteSEF		(0)	(0)
+#BisRDn			(0)	(0)
+#BisRUp			(0)	(0)
+#INPdown		(0.00)	(0.00)
+#INPup			(0.00)	(0.00)
+
